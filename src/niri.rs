@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::{cmp, env, mem, thread};
+use std::{env, mem, thread};
 
 use _server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDecorationsMode;
 use anyhow::{bail, ensure, Context};
@@ -159,6 +159,7 @@ use crate::ui::exit_confirm_dialog::ExitConfirmDialog;
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
+use crate::ui::window_mru_ui::{WindowMruUi, WindowMruUiRenderElement};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::CHILD_ENV;
 use crate::utils::{
@@ -358,6 +359,7 @@ pub struct Niri {
     pub lock_state: LockState,
 
     pub screenshot_ui: ScreenshotUi,
+    pub window_mru_ui: WindowMruUi,
     pub config_error_notification: ConfigErrorNotification,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: Option<ExitConfirmDialog>,
@@ -389,10 +391,6 @@ pub struct Niri {
     /// Window ID for the "dynamic cast" special window for the xdp-gnome picker.
     #[cfg(feature = "xdp-gnome-screencast")]
     pub dynamic_cast_id_for_portal: MappedId,
-
-    // List of windows for MRU prev/next traversal.
-    // Only defined when there is an active traversal in progress
-    pub window_mru: Option<WindowMRU>,
 
     pending_mru_commit: Option<PendingMruCommit>,
 }
@@ -909,34 +907,6 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
-    /// Focus the next window in MRU order.
-    pub fn focus_window_mru_next(&mut self) {
-        let mut wmru = self
-            .niri
-            .window_mru
-            .take()
-            .unwrap_or_else(|| WindowMRU::new(&mut self.niri));
-
-        if let Some(window) = wmru.advance(&self.niri, false) {
-            self.focus_window(&window);
-        }
-        self.niri.window_mru.replace(wmru);
-    }
-
-    /// Focus the previous window in MRU order.
-    pub fn focus_window_mru_previous(&mut self) {
-        let mut wmru = self
-            .niri
-            .window_mru
-            .take()
-            .unwrap_or_else(|| WindowMRU::new(&mut self.niri));
-
-        if let Some(window) = wmru.advance(&self.niri, true) {
-            self.focus_window(&window);
-        }
-        self.niri.window_mru.replace(wmru);
-    }
-
     pub fn maybe_warp_cursor_to_focus(&mut self) -> bool {
         let focused = match self.niri.config.borrow().input.warp_mouse_to_focus {
             None => return false,
@@ -1233,15 +1203,7 @@ impl State {
 
                     if mapped.get_focus_timestamp().is_none() {
                         mapped.update_focus_timestamp(stamp);
-
-                        // if there was an active windows-mru, insert this
-                        // new window into the list to avoid surprising the
-                        // user if they focus another window and then want
-                        // to immediately return to the newly created window
-                        if let Some(ref mut wmru) = self.niri.window_mru {
-                            wmru.ids.insert(wmru.current, focus_id);
-                        }
-                    } else if self.niri.window_mru.is_none() {
+                    } else {
                         let timer =
                             Timer::from_duration(Duration::from_millis(DEFAULT_MRU_COMMIT_MS));
 
@@ -2453,6 +2415,7 @@ impl Niri {
         let mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(mod_key, &config_.binds);
 
         let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
+        let window_mru_ui = WindowMruUi::new();
         let config_error_notification =
             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
 
@@ -2648,6 +2611,7 @@ impl Niri {
             lock_state: LockState::Unlocked,
 
             screenshot_ui,
+            window_mru_ui,
             config_error_notification,
             hotkey_overlay,
             exit_confirm_dialog,
@@ -2677,7 +2641,6 @@ impl Niri {
             #[cfg(feature = "xdp-gnome-screencast")]
             dynamic_cast_id_for_portal: MappedId::next(),
 
-            window_mru: None,
             pending_mru_commit: None,
         };
 
@@ -4047,7 +4010,7 @@ impl Niri {
         self.layout.update_render_elements(output);
 
         for (out, state) in self.output_state.iter_mut() {
-            if output.map_or(true, |output| out == output) {
+            if output.is_none_or(|output| out == output) {
                 let scale = Scale::from(out.current_scale().fractional_scale());
                 let transform = out.current_transform();
 
@@ -4190,6 +4153,15 @@ impl Niri {
             return elements;
         }
 
+        if self.window_mru_ui.is_open() && Some(output) == self.layout.active_output() {
+            elements.extend(
+                self.window_mru_ui
+                    .render_output(self, output, target, renderer.as_gles_renderer())
+                    .into_iter()
+                    .map(OutputRenderElements::from),
+            )
+        }
+
         // Draw the hotkey overlay on top.
         if let Some(element) = self.hotkey_overlay.render(renderer, output) {
             elements.push(element.into());
@@ -4197,7 +4169,10 @@ impl Niri {
 
         // Don't draw the focus ring on the workspaces while interactively moving above those
         // workspaces, since the interactively-moved window already has a focus ring.
-        let focus_ring = !self.layout.interactive_move_is_moving_above_output(output);
+        // Likewise, don't draw the focus ring while the MRU UI is open to avoid the confusion
+        // of having two focus rings on screen.
+        let focus_ring = !(self.layout.interactive_move_is_moving_above_output(output)
+            || self.window_mru_ui.is_open());
 
         // Get monitor elements.
         let mon = self.layout.monitor_for_output(output).unwrap();
@@ -6181,49 +6156,6 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
-impl WindowMRU {
-    fn new(niri: &mut Niri) -> Self {
-        // update the focus timestamp on the currently active window and
-        // prepare a new WindowMRU
-        niri.mru_commit();
-
-        // and build a list of MappedId sorted by timestamp
-        let mut ts_ids: Vec<(Option<Instant>, MappedId)> = niri
-            .layout
-            .windows()
-            .map(|(_, w)| (w.get_focus_timestamp(), w.id()))
-            .collect();
-        ts_ids.sort_by(|(t1, _), (t2, _)| match (t1, t2) {
-            (None, None) => cmp::Ordering::Equal,
-            (Some(_), None) => cmp::Ordering::Less,
-            (None, Some(_)) => cmp::Ordering::Greater,
-            (Some(t1), Some(t2)) => t1.cmp(t2).reverse(),
-        });
-
-        let ids = ts_ids.into_iter().map(|(_, id)| id).collect();
-
-        WindowMRU { ids, current: 0 }
-    }
-
-    fn advance(&mut self, niri: &Niri, reversed: bool) -> Option<Window> {
-        while !self.ids.is_empty() {
-            self.current = if reversed {
-                self.current.checked_sub(1).unwrap_or(self.ids.len() - 1)
-            } else {
-                (self.current + 1) % self.ids.len()
-            };
-
-            if let Some(id) = self.ids.get(self.current) {
-                if let Some(window) = niri.find_window_by_id(*id) {
-                    return Some(window);
-                }
-                self.ids.remove(self.current);
-            }
-        }
-        None
-    }
-}
-
 fn scale_relocate_crop<E: Element>(
     elem: E,
     output_scale: Scale<f64>,
@@ -6251,6 +6183,7 @@ niri_render_elements! {
             SolidColorRenderElement
         >>>,
         ScreenshotUi = ScreenshotUiRenderElement,
+        WindowMruUi = WindowMruUiRenderElement,
         Texture = PrimaryGpuTextureRenderElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,

@@ -249,6 +249,7 @@ impl CompositorHandler for State {
                         .stop_casts_for_target(CastTarget::Window { id: id.get() });
 
                     self.niri.layout.remove_window(&window, transaction.clone());
+                    self.niri.window_mru_ui.remove_window(id);
                     self.add_default_dmabuf_pre_commit_hook(surface);
 
                     // If this is the only instance, then this transaction will complete
@@ -258,11 +259,7 @@ impl CompositorHandler for State {
                     }
 
                     if was_active {
-                        if self.niri.window_mru.is_some() {
-                            self.focus_window_mru_next();
-                        } else {
-                            self.maybe_warp_cursor_to_focus();
-                        }
+                        self.maybe_warp_cursor_to_focus();
                     }
 
                     // Newly-unmapped toplevels must perform the initial commit-configure sequence

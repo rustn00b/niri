@@ -1586,6 +1586,15 @@ pub enum RelativeTo {
 #[derive(Debug, Default, PartialEq)]
 pub struct Binds(pub Vec<Bind>);
 
+impl<'a> IntoIterator for &'a Binds {
+    type Item = &'a Bind;
+    type IntoIter = std::slice::Iter<'a, Bind>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bind {
     pub key: Key,
@@ -1652,6 +1661,33 @@ pub struct SwitchAction {
     pub spawn: Vec<String>,
 }
 
+#[derive(knuffel::DecodeScalar, Clone, Copy, Debug, Default, PartialEq)]
+pub enum MruDirection {
+    #[default]
+    Forward, // From most recently used to least
+    Backward, // From least recently used to most
+}
+
+#[derive(knuffel::DecodeScalar, Clone, Copy, Debug, Default, PartialEq)]
+pub enum MruScope {
+    /// Consider all windows
+    #[default]
+    All,
+    /// Consider windows on the active output
+    Output,
+    /// Consider windows on the active workspace
+    Workspace,
+}
+
+#[derive(knuffel::DecodeScalar, Clone, Copy, Debug, Default, PartialEq)]
+pub enum MruFilter {
+    /// No filter
+    #[default]
+    None,
+    /// Windows with the same AppId as the active window
+    AppId,
+}
+
 // Remember to add new actions to the CLI enum too.
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub enum Action {
@@ -1699,10 +1735,6 @@ pub enum Action {
     FocusWindow(u64),
     FocusWindowInColumn(#[knuffel(argument)] u8),
     FocusWindowPrevious,
-    #[knuffel(skip)]
-    FocusWindowMruNext,
-    #[knuffel(skip)]
-    FocusWindowMruPrevious,
     FocusColumnLeft,
     #[knuffel(skip)]
     FocusColumnLeftUnderMouse,
@@ -1901,6 +1933,24 @@ pub enum Action {
     SetWindowUrgent(u64),
     #[knuffel(skip)]
     UnsetWindowUrgent(u64),
+
+    MruAdvance(
+        #[knuffel(argument)] MruDirection,
+        #[knuffel(property(name = "scope"))] Option<MruScope>,
+        #[knuffel(property(name = "filter"))] Option<MruFilter>,
+    ),
+    #[knuffel(skip)]
+    MruClose,
+    #[knuffel(skip)]
+    MruCancel,
+    #[knuffel(skip)]
+    MruCloseCurrent,
+    #[knuffel(skip)]
+    MruFirst,
+    #[knuffel(skip)]
+    MruLast,
+    #[knuffel(skip)]
+    MruChangeScope(#[knuffel(argument)] MruScope),
 }
 
 impl From<niri_ipc::Action> for Action {
@@ -1940,8 +1990,6 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::FocusWindow { id } => Self::FocusWindow(id),
             niri_ipc::Action::FocusWindowInColumn { index } => Self::FocusWindowInColumn(index),
             niri_ipc::Action::FocusWindowPrevious {} => Self::FocusWindowPrevious,
-            niri_ipc::Action::FocusWindowMruNext {} => Self::FocusWindowMruNext,
-            niri_ipc::Action::FocusWindowMruPrevious {} => Self::FocusWindowMruPrevious,
             niri_ipc::Action::FocusColumnLeft {} => Self::FocusColumnLeft,
             niri_ipc::Action::FocusColumnRight {} => Self::FocusColumnRight,
             niri_ipc::Action::FocusColumnFirst {} => Self::FocusColumnFirst,
